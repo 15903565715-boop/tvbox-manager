@@ -1,11 +1,16 @@
-import os
+﻿import os
+import re
+import base64
 import sqlite3
 import json
 import secrets
+import time
+import copy
 import concurrent.futures
 import requests
 import logging
 from functools import wraps
+from urllib.parse import urljoin
 from flask import Flask, request, session, redirect, url_for, render_template, jsonify, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -16,24 +21,30 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Initialization & Logging ---
 app = Flask(__name__)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- Configuration & Constants ---
-APP_VERSION = "v1.0.41"
+APP_VERSION = "v1.0.45"
 app.secret_key = os.environ.get('SECRET_KEY', 'super-secret-starlink-clone-key')
 DATABASE = os.environ.get('DB_PATH', '/app/data/database.db')
 REG_CODE = os.environ.get('REG_CODE', '888888')
 BASE_URL = os.environ.get('BASE_URL', '').rstrip('/')
-HTTP_TIMEOUT = 8
+HTTP_TIMEOUT = 10
+# 远端配置缓存（30 分钟），避免每次订阅请求都实时拉取上游
+CONFIG_CACHE_TTL = int(os.environ.get('CONFIG_CACHE_TTL', 1800))
+_config_cache = {}
+
+# 服务端拉取上游时的身份：必须模拟 TVBox 客户端（okhttp）。
+# 多数源站按 UA 区分流量——浏览器 UA 会收到 HTML/挑战页，okhttp 才返回纯 JSON 配置。
+UA_TVBOX = 'okhttp/3.15.0'
+UA_BROWSER = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 
 # 全局 HTTP 会话
 http_session = requests.Session()
-http_session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-})
+http_session.headers.update({'User-Agent': UA_TVBOX})
 
 @app.errorhandler(Exception)
 def handle_exception(e):
@@ -125,28 +136,113 @@ def jsonify_success(message='操作成功', **kwargs):
 def jsonify_error(message='操作失败', code=200):
     return jsonify({'status': 'error', 'message': message}), code
 
-def parse_aggregate_source(url):
-    """尝试解析并解构多仓 JSON"""
-    try:
-        # 只针对可能是 JSON 的 URL 进行尝试
-        if not ('urls' in url or url.endswith('.json')):
-            return None
-            
-        r = http_session.get(url, timeout=HTTP_TIMEOUT, verify=False)
-        if r.status_code != 200:
-            return None
-            
-        content = r.text.strip()
-        # 兼容性处理：剔除特殊注释
-        if content.startswith('//'):
-            content = '\n'.join([l for l in content.split('\n') if not l.strip().startswith('//')])
+def _cache_put(url, kind, data):
+    if len(_config_cache) > 500:
+        _config_cache.clear()
+    _config_cache[url] = (time.time() + CONFIG_CACHE_TTL, kind, data)
+    return kind, data
 
-        json_data = json.loads(content)
-        if isinstance(json_data, dict) and "urls" in json_data and isinstance(json_data["urls"], list):
-            return json_data["urls"]
-    except:
+# --- TVBox 配置拉取（宽松解析 + 图片伪装支持） ---
+_JPEG_SOI = b'\xff\xd8\xff'
+_PNG_SIG = b'\x89PNG\r\n\x1a\n'
+
+def _loads_lenient(text):
+    """宽松 JSON 解析：容忍 // 整行注释与尾随逗号（TVBox 生态配置常见写法）。
+    返回解析结果，无法解析时返回 None。"""
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
         pass
+    t = text
+    if '//' in t:
+        # 只剔除行首注释行（字符串内的 https:// 不受影响）
+        t = '\n'.join([l for l in t.split('\n') if not l.strip().startswith('//')])
+    for candidate in (t, re.sub(r',\s*(\}|\])', r'\1', t)):
+        try:
+            return json.loads(candidate)
+        except ValueError:
+            continue
     return None
+
+def _extract_image_hidden(raw):
+    """提取藏在图片文件尾部的 base64 JSON。
+
+    TVBox 生态流行的伪装分发方式（如饭太硬）：JPEG/PNG 图片数据 + Base64 编码的
+    配置 JSON 拼接存放。TVBox 客户端会识别，服务端拆包同样需要支持。
+    """
+    if raw[:3] == _JPEG_SOI:
+        marker = raw.rfind(b'\xff\xd9')            # JPEG EOI
+        tail = raw[marker + 2:] if marker >= 0 else b''
+    elif raw[:8] == _PNG_SIG:
+        marker = raw.rfind(b'IEND')                # PNG IEND 块（+4 字节 CRC）
+        tail = raw[marker + 8:] if marker >= 0 else b''
+    else:
+        return None
+    # 清洗干扰字符后按 base64 解码
+    b64 = re.sub(rb'[^A-Za-z0-9+/=]', b'', tail)
+    if len(b64) < 100:
+        return None
+    try:
+        decoded = base64.b64decode(b64 + b'=' * (-len(b64) % 4), validate=False)
+        text = decoded.decode('utf-8', errors='ignore')
+    except Exception:
+        return None
+    pos = text.find('{')
+    if pos < 0:
+        return None
+    return _loads_lenient(text[pos:])
+
+def fetch_tv_config(url):
+    """拉取远端配置并识别类型（带缓存）。
+
+    返回 (kind, data):
+      kind = 'multi'  多仓 JSON：{"urls": [...]}
+             'single' 单仓 JSON：含 "sites" 数组
+             'api'    合法 JSON 但非配置结构（大概率是 CMS vod 接口，可直接当 site api）
+             'raw'    非 JSON（HTML/挑战页）/ 请求失败（data 恒为 None）
+
+    兼容三种真实生态形态：纯 JSON、带 // 注释的 JSON、图片伪装（JPEG/PNG 尾藏 base64 JSON）。
+    UA 策略：先以 TVBox 客户端身份（okhttp）请求——源站对浏览器 UA 常返回
+    HTML/挑战页；若 okhttp 得到非 JSON，再用浏览器 UA 兜底一次。
+    """
+    hit = _config_cache.get(url)
+    if hit and hit[0] > time.time():
+        return hit[1], hit[2]
+
+    for ua in (UA_TVBOX, UA_BROWSER):
+        try:
+            r = http_session.get(url, timeout=HTTP_TIMEOUT, verify=False, headers={'User-Agent': ua})
+            if r.status_code != 200:
+                continue  # 非 200 换 UA 再试（403 可能是 WAF 按 UA 拦截）
+            raw = r.content
+            # 强制 UTF-8 解码（utf-8-sig 兼容带 BOM 的响应）：
+            # 上游源站响应头普遍不带 charset，requests 会退回 ISO-8859-1，
+            # UTF-8 中文站点名被解码成乱码（JSON 结构仍是合法的，但 name 全花）
+            content = raw.decode('utf-8-sig', errors='replace').strip()
+            if content.startswith('//'):
+                content = '\n'.join([l for l in content.split('\n') if not l.strip().startswith('//')])
+            data = _loads_lenient(content)
+            if data is None:
+                # 图片伪装：JPEG/PNG 尾部藏 base64(JSON)
+                data = _extract_image_hidden(raw)
+            if data is None:
+                continue  # 当前 UA 拿到的是 HTML/无隐藏内容的图片 → 换下一个 UA 重试
+        except Exception:
+            continue  # 连接异常 → 换 UA 重试一次
+
+        if isinstance(data, dict):
+            if isinstance(data.get('urls'), list) and data['urls']:
+                return _cache_put(url, 'multi', data)
+            if isinstance(data.get('sites'), list):
+                return _cache_put(url, 'single', data)
+            return _cache_put(url, 'api', data)
+        return _cache_put(url, 'api', data)
+
+    # 两种 UA 均失败：不缓存，避免上游抖动后被长时间记为坏源
+    _config_cache.pop(url, None)
+    return 'raw', None
 
 @app.context_processor
 def inject_version():
@@ -241,14 +337,15 @@ def api_source_add():
 
     if not name or not url: return jsonify_error('名称和 URL 不能为空')
 
-    # 1. 尝试作为多仓 JSON 解析
-    aggregate_urls = parse_aggregate_source(url)
-    if aggregate_urls:
+    # 1. 尝试作为多仓 JSON 解析（按响应内容判断，不再依赖 .json 后缀）
+    kind, remote = fetch_tv_config(url)
+    if kind == 'multi' and remote:
         added = 0
         with get_db() as db:
             existens = {row['url'] for row in db.execute('SELECT url FROM sources WHERE user_id = ?', (user_id,)).fetchall()}
-            for entry in aggregate_urls:
-                e_url = entry.get('url', '').strip()
+            for entry in remote.get('urls', []):
+                if not isinstance(entry, dict): continue
+                e_url = str(entry.get('url') or '').strip()
                 if e_url and e_url not in existens:
                     db.execute('INSERT INTO sources (user_id, name, url, type) VALUES (?, ?, ?, ?)', 
                                (user_id, entry.get('name', '未命名'), e_url, stype))
@@ -320,7 +417,8 @@ def api_source_check():
     if not url: return jsonify_error('URL missing')
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        # 检测身份与 TVBox 客户端保持一致，避免源站对浏览器 UA 返回 HTML 导致误判 offline
+        'User-Agent': UA_TVBOX
     }
     
     try:
@@ -355,23 +453,23 @@ def api_external_aipan():
             except: pass
             break
     
-    # 2. 爱盼接口推荐
+    # 2. 爱盼接口推荐（网页 API，需浏览器 UA）
     try:
-        r = http_session.get('https://www.aipan.me/api/tvbox', timeout=5, verify=False)
+        r = http_session.get('https://www.aipan.me/api/tvbox', timeout=5, verify=False, headers={'User-Agent': UA_BROWSER})
         if r.status_code == 200: combined_list.extend(r.json().get('list', []))
     except: pass
 
-    # 3. 兜底列表
+    # 3. 兜底列表（2026-08 实测可用；饭太硬已迁移到 .net 域名）
     if not combined_list:
         combined_list = [
-            {"name": "🌟 饭太硬", "link": "http://饭太硬.top/tv"},
-            {"name": "🐱 肥猫", "link": "http://肥猫.com"},
-            {"name": "🐉 道长", "link": "https://pastebin.com/raw/5NHaxyO7"},
-            {"name": "💨 南风", "link": "https://m3u8.xn--nwy97m.cn/nanfeng/lite.json"},
-            {"name": "📦 荷城茶秀", "link": "http://rihou.cc:88/荷城茶秀"},
-            {"name": "📱 小米", "link": "http://xhww.fun:63/小米/DEMO.json"},
-            {"name": "🚀 欧歌", "link": "http://tv.nxog.top/m"},
-            {"name": "🐼 熊猫", "link": "https://jihulab.com/yw88075/tvbox/-/raw/main/tv/tv.json"},
+            {"name": "🌟 饭太硬", "link": "http://www.饭太硬.net/tv"},
+            {"name": "🐱 肥猫", "link": "http://肥猫.net/"},
+            {"name": "🐟 摸鱼儿", "link": "http://摸鱼儿.cc"},
+            {"name": "🚀 小盒子多仓", "link": "http://xhztv.top/dc"},
+            {"name": "🎬 小盒子单仓", "link": "http://xhztv.top/xhz"},
+            {"name": "🧓 老刘备", "link": "https://raw.liucn.cc/box/m.json"},
+            {"name": "🐴 小马", "link": "https://szyyds.cn/tv/x.json"},
+            {"name": "📦 VOX", "link": "http://rihou.cc:88/demo.php"},
         ]
 
     # 去重处理
@@ -452,33 +550,191 @@ def api_admin_push_recommendations():
         return jsonify_success(f'成功更新 {len(normalized)} 条推荐源')
     except Exception as e: return jsonify_error(str(e))
 
+# --- TVBox Single-Config Builder ---
+def _absolutize(cfg, base_url):
+    """把仓内相对路径转为基于源仓地址的绝对 URL。
+
+    TVBox 按配置文件地址解析相对路径（ext/jar/spider/wallpaper）。
+    拆包合并后配置地址变成了本服务的订阅 URL，相对路径必然失效，必须转绝对。
+    """
+    if not base_url or not isinstance(cfg, dict):
+        return cfg
+
+    def fix(v):
+        if isinstance(v, str) and v.startswith(('./', '../')):
+            return urljoin(base_url, v)
+        return v
+
+    def fix_in(d, *keys):
+        """仅当字段存在且为相对路径时改写，避免引入 null 字段"""
+        for k in keys:
+            v = d.get(k)
+            if isinstance(v, str):
+                d[k] = fix(v)
+
+    # spider 支持 "jar路径;md5;加密key" 复合格式，只转路径段
+    spider = cfg.get('spider')
+    if isinstance(spider, str) and spider.split(';')[0].startswith(('./', '../')):
+        parts = spider.split(';')
+        parts[0] = urljoin(base_url, parts[0])
+        cfg['spider'] = ';'.join(parts)
+
+    fix_in(cfg, 'wallpaper')
+    for site in (cfg.get('sites') or []):
+        if not isinstance(site, dict):
+            continue
+        ext = site.get('ext')
+        if isinstance(ext, str):
+            site['ext'] = fix(ext)
+        elif isinstance(ext, dict):
+            fix_in(ext, 'jar', 'url')
+        fix_in(site, 'jar', 'wallpaper')
+    for live in (cfg.get('lives') or []):
+        if isinstance(live, dict):
+            fix_in(live, 'url')
+    return cfg
+
+
+def _build_single_config(sources):
+    """把用户源列表构建为 TVBox 单仓配置。
+
+    核心改进：
+    1. 任何 URL 先拉取内容判断类型（多仓/单仓/裸接口），不再按后缀猜测；
+    2. 拆包时透传 site 原有 type / ext / jar 等字段，不再统一强制 type:1；
+    3. 仓级 spider 下沉为站点级 jar（多仓合并后爬虫源不丢 jar），同时保留全局 spider；
+    4. 合并 lives / parses / wallpaper；
+    5. 并发拉取上游 + 30 分钟缓存。
+    """
+    out = {'sites': [], 'lives': [], 'parses': [], 'wallpaper': ''}
+    state = {'spider': '', 'seen_keys': set(), 'seen_apis': set(), 'seen_parses': set()}
+
+    def add_site(site, fallback_name='', spider=''):
+        if not isinstance(site, dict):
+            return
+        api = str(site.get('api') or site.get('url') or '').strip()
+        if not api or api in state['seen_apis']:
+            return
+        state['seen_apis'].add(api)
+        s = copy.deepcopy(site)
+        key = s.get('key')
+        if not isinstance(key, str) or not key or key in state['seen_keys']:
+            key = f"s{len(out['sites'])}"
+        s['key'] = key
+        state['seen_keys'].add(key)
+        if not s.get('name'):
+            s['name'] = fallback_name or key
+        if s.get('type') in (None, ''):
+            s['type'] = 1
+        # 爬虫/聚合类源依赖仓级 spider jar：合并多仓后统一下沉为站点级 jar，防止丢失
+        if spider and not s.get('jar') and s.get('type') in (3, 4):
+            s['jar'] = spider
+        out['sites'].append(s)
+
+    def add_live(live, fallback_name=''):
+        if isinstance(live, dict) and str(live.get('url') or '').strip():
+            l = copy.deepcopy(live)
+            if not l.get('name'):
+                l['name'] = fallback_name or 'live'
+            if l.get('type') in (None, ''):
+                l['type'] = 0
+            out['lives'].append(l)
+
+    def merge_config(cfg, fallback_name, base_url=''):
+        """把一个单仓 dict 合并进输出（先把相对路径绝对化）"""
+        cfg = _absolutize(cfg, base_url)
+        spider = str(cfg.get('spider') or '').strip()
+        if spider and not state['spider']:
+            state['spider'] = spider
+        for site in (cfg.get('sites') or []):
+            add_site(site, fallback_name, spider)
+        for live in (cfg.get('lives') or []):
+            add_live(live, fallback_name)
+        for p in (cfg.get('parses') or []):
+            if isinstance(p, dict):
+                pkey = str(p.get('url') or p.get('name') or '')
+                if pkey and pkey not in state['seen_parses']:
+                    state['seen_parses'].add(pkey)
+                    out['parses'].append(copy.deepcopy(p))
+        if not out['wallpaper'] and cfg.get('wallpaper'):
+            out['wallpaper'] = cfg['wallpaper']
+
+    def collect(url, name, depth, seen_urls):
+        """递归收集：返回 True 表示该 URL 已按可用形式并入"""
+        if not url or url in seen_urls:
+            return True
+        seen_urls.add(url)
+        kind, data = fetch_tv_config(url)
+        if kind == 'single':
+            merge_config(data, name, url)
+            return True
+        if kind == 'multi' and depth < 2:
+            entries = []
+            for entry in (data.get('urls') or []):
+                if isinstance(entry, dict):
+                    e_url = str(entry.get('url') or '').strip()
+                    e_name = str(entry.get('name') or '').strip() or name
+                    if e_url:
+                        entries.append((e_url, e_name))
+            if entries:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+                    futures = [ex.submit(collect, u, n, depth + 1, seen_urls) for u, n in entries]
+                    for f in futures:
+                        f.result()
+                return True
+        if kind == 'api':
+            # 合法 JSON 但非配置结构：大概率是 CMS vod 接口，直接作为站点 api 输出
+            add_site({'api': url, 'name': name, 'type': 1}, name)
+            return True
+        # raw：HTML/挑战页/网络失败——输出壳地址 TVBox 也无法使用，跳过（宁缺毋滥）
+        logger.warning(f"single 模式跳过不可解析的源: [{name}] {url}")
+        return False
+
+    site_rows = [r for r in sources if (r['type'] or 'site') == 'site']
+    live_rows = [r for r in sources if (r['type'] or 'site') != 'site']
+
+    # 并发拆包所有 site 类源（不可解析的源已在 collect 内跳过并记日志，不再输出壳地址）
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(collect, r['url'], r['name'], 0, set()): r['url'] for r in site_rows}
+        for f in futures:
+            f.result()
+
+    # 用户自建的直播源：每组独立输出，格式更规范
+    for r in live_rows:
+        add_live({'url': r['url'], 'name': r['name'], 'type': 0, 'playerType': 1}, r['name'])
+
+    config = {'sites': out['sites']}
+    if out['lives']:
+        config['lives'] = out['lives']
+    if state['spider']:
+        config['spider'] = state['spider']
+    if out['parses']:
+        config['parses'] = out['parses']
+    if out['wallpaper']:
+        config['wallpaper'] = out['wallpaper']
+    return config
+
 # --- Public Subscription API ---
 @app.route('/api/subscribe/<username>.json')
 def get_tvbox_json(username):
     etype, only_online = request.args.get('type', 'multi'), request.args.get('only_online') == 'true'
-    
+
     with get_db() as db:
         user = db.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
-        if not user: return jsonify_error('用户不存在', 404)
-            
+        if not user:
+            return jsonify_error('用户不存在', 404)
         sql = 'SELECT * FROM sources WHERE user_id = ?' + (' AND status = "online"' if only_online else '') + ' ORDER BY order_index ASC, id ASC'
         sources = db.execute(sql, (user['id'],)).fetchall()
-    
+
     if etype == 'single':
-        config = { "sites": [], "lives": [{"name": "live", "type": 0, "url": "", "playerType": 1}] }
-        lives = []
-        for r in sources:
-            if r['type'] == 'site':
-                config["sites"].append({"key": f"s_{r['id']}", "name": r['name'], "type": 3, "api": "csp_XBPQ", "ext": r['url']})
-            else: lives.append(f"{r['name']}, {r['url']}")
-        if lives: config["lives"][0]["url"] = "#".join(lives)
+        config = _build_single_config(sources)
     else:
         config = {"urls": [{"url": r['url'], "name": r['name']} for r in sources]}
-            
+
     json_str = json.dumps(config, indent=4, ensure_ascii=False)
     if request.args.get('comment') == 'true':
-        json_str = f"//TVBox 专属配置 - {'多仓' if etype == 'multi' else '单仓'}\n" + json_str
-    
+        tag = "多仓" if etype == "multi" else "单仓"
+        json_str = "//TVBox 专属配置 - " + tag + "\n" + json_str
+
     res = Response(json_str, mimetype='application/json; charset=utf-8')
     res.headers.add('Access-Control-Allow-Origin', '*')
     return res
