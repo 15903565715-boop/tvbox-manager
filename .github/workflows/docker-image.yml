@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write  # 必须授权才能推送镜像到 GHCR
+      packages: write
 
     steps:
       - name: Checkout repository
@@ -20,8 +20,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: 15903565715-boop
-          password: Changdf770926
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -31,4 +31,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/{15903565715-boop/tvbox-manager}:latest
+          tags: ghcr.io/15903565715-boop/tvbox-manager:latest
